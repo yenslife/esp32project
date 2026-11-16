@@ -1,0 +1,9 @@
+[project]
+name = "esp32project"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi==0.115.12",
+    "pyserial>=3.5",
+    "uvicorn==0.34.2",
+]

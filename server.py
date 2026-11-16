@@ -17,12 +17,15 @@ import time
 import wave
 import zlib
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageChops, ImageFilter
+from pydantic import BaseModel, Field, ValidationError
 
+TCP_HOST = os.environ.get("ESP32_TCP_HOST", "0.0.0.0")
 TCP_PORT = 9000
 SAMPLE_RATE = 16000
 
@@ -38,8 +41,8 @@ AUDIO_REF_RMS = 2000.0        # 依 XIAO PDM 麥克風實測校準（安靜底�
 DEFAULT_AUDIO_PCT = 3.5       # 預設聲音變化門檻（%）
 AUDIO_MIN_CHUNKS = 2          # 持續聲音至少 2 個 chunk（~256ms），或單次拍手 >= 2 倍門檻
 
-VALID_TRIGGER_MODES = {"video", "audio", "either", "both"}
-RETENTION_DAYS = 7            # 自動保留最近 7 天
+TriggerMode = Literal["video", "audio", "either", "both"]
+CONFIG_PATH = Path("config.json")
 
 REC_AUDIO = 1
 REC_FRAME = 2
@@ -217,23 +220,77 @@ def mux_event_sync(stem_path: Path, started_at: datetime, chunks: list[MediaChun
     return meta
 
 
-def cleanup_old_recordings(retention_days: float = RETENTION_DAYS) -> int:
-    if not RECORDINGS_ROOT.exists():
-        return 0
-    cutoff = time.time() - retention_days * 86400
-    removed = 0
-    for sub in ("events", "segments"):
-        d = RECORDINGS_ROOT / sub
-        if not d.exists():
+class Settings(BaseModel):
+    monitoring_enabled: bool = True
+    trigger_mode: TriggerMode = "either"
+    motion_threshold_pct: float = Field(DEFAULT_MOTION_PCT, ge=0.5, le=30)
+    audio_threshold_pct: float = Field(DEFAULT_AUDIO_PCT, ge=0.5, le=50)
+    retention_days: int = Field(7, ge=1, le=30)
+    max_recording_gb: float = Field(10, gt=0, allow_inf_nan=False)
+
+
+def load_settings() -> Settings:
+    try:
+        return Settings.model_validate_json(CONFIG_PATH.read_bytes())
+    except FileNotFoundError:
+        return Settings()
+    except (OSError, ValidationError):
+        print("[CONFIG] 無法讀取 config.json，使用預設設定")
+        return Settings()
+
+
+def save_settings(settings: Settings):
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=CONFIG_PATH.parent, prefix=".config-", suffix=".tmp", delete=False
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            tmp.write(settings.model_dump_json(indent=2).encode() + b"\n")
+        os.replace(tmp_path, CONFIG_PATH)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def cleanup_recordings(settings: Settings) -> int:
+    cutoff = time.time() - settings.retention_days * 86400
+    limit = settings.max_recording_gb * 1_000_000_000
+    total_bytes = 0
+    groups: dict[Path, list[tuple[Path, os.stat_result]]] = {}
+    for path in RECORDINGS_ROOT.rglob("*"):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            stat = path.stat()
+        except FileNotFoundError:
             continue
-        for p in d.iterdir():
-            if p.is_file() and p.suffix in {".mp4", ".jpg", ".json"}:
-                try:
-                    if p.stat().st_mtime < cutoff:
-                        p.unlink()
-                        removed += 1
-                except OSError:
-                    pass
+        total_bytes += stat.st_size
+        if path.suffix not in {".mp4", ".jpg", ".json"}:
+            continue
+        stem = path.with_suffix("")
+        if path.parent == EVENTS_DIR and SAFE_EVENT_ID.fullmatch(stem.name.removesuffix(".tmp")):
+            stem = stem.with_name(stem.name.removesuffix(".tmp"))
+        elif path.parent != RECORDINGS_ROOT / "segments":
+            continue
+        groups.setdefault(stem, []).append((path, stat))
+
+    removed = 0
+    ordered = sorted(
+        (min(stat.st_mtime for _, stat in files), stem)
+        for stem, files in groups.items()
+    )
+    for oldest, stem in ordered:
+        if oldest >= cutoff and total_bytes <= limit:
+            break
+        for path, stat in groups[stem]:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                print(f"[CLEANUP] 無法刪除 {path}: {exc}")
+                continue
+            total_bytes -= stat.st_size
+            removed += 1
     return removed
 
 
@@ -256,7 +313,8 @@ class StreamState:
         self.connected = False
         self.peer: str | None = None
         self.writer: asyncio.StreamWriter | None = None
-        self.monitoring_enabled = True
+        self.settings = Settings()
+        self.recordings_lock = asyncio.Lock()
 
         self.latest_jpeg: bytes | None = None
         self.frame_seq = 0
@@ -269,10 +327,6 @@ class StreamState:
         self.esp_stat: dict = {}
 
         self.detector = MotionDetector()
-        self.trigger_mode = "either"  # video | audio | either | both
-        self.motion_threshold_pct = DEFAULT_MOTION_PCT
-        self.audio_threshold_pct = DEFAULT_AUDIO_PCT
-        self.retention_days = RETENTION_DAYS
         self.live_motion_pct = 0.0
         self.live_audio_pct = 0.0
         self.last_motion_at: str | None = None
@@ -318,11 +372,11 @@ class StreamState:
         self.live_audio_pct = 0.0
 
     def _matches_trigger_mode(self, chunk: MediaChunk) -> bool:
-        if self.trigger_mode == "video":
+        if self.settings.trigger_mode == "video":
             return chunk.video_triggered
-        if self.trigger_mode == "audio":
+        if self.settings.trigger_mode == "audio":
             return chunk.audio_triggered
-        if self.trigger_mode == "both":
+        if self.settings.trigger_mode == "both":
             return chunk.video_triggered and chunk.audio_triggered
         return chunk.video_triggered or chunk.audio_triggered
 
@@ -332,7 +386,7 @@ class StreamState:
             self.frame_seq += 1
             score = self.detector.score(payload)
             self.live_motion_pct = score
-            if score >= self.motion_threshold_pct:
+            if score >= self.settings.motion_threshold_pct:
                 self.last_motion_at = datetime.now().isoformat(timespec="seconds")
             self.frames_buf.append((t_us, payload, score))
             self._broadcast_ws(b"\x02" + payload)
@@ -389,8 +443,8 @@ class StreamState:
             if not c_frames or not c_audio:
                 continue
 
-            v_thr = self.motion_threshold_pct
-            a_thr = self.audio_threshold_pct
+            v_thr = self.settings.motion_threshold_pct
+            a_thr = self.settings.audio_threshold_pct
             motion_frames = sum(1 for _, _, s in c_frames if s >= v_thr)
             peak_frame = max(c_frames, key=lambda x: x[2])
             loud_chunks = sum(1 for _, _, a in c_audio if a >= a_thr)
@@ -431,7 +485,7 @@ class StreamState:
                     by_audio=chunk.audio_triggered,
                 )
                 self.pre_roll = None
-                print(f"[TRIGGER:{self.trigger_mode}] Event started "
+                print(f"[TRIGGER:{self.settings.trigger_mode}] Event started "
                       f"(motion={chunk.peak_motion_pct}%, audio={chunk.peak_audio_pct}%)")
             else:
                 self.active_event.chunks.append(chunk)
@@ -480,15 +534,34 @@ class StreamState:
                             next_frame_us: int | None, peak_motion_pct: float,
                             peak_audio_pct: float, reason: str, peak_jpeg: bytes):
         try:
-            meta = await asyncio.to_thread(
-                mux_event_sync, stem, started_at, chunks, next_frame_us,
-                peak_motion_pct, peak_audio_pct, reason, peak_jpeg
-            )
-            self.events.append(meta)
-            print(f"[EVENT SAVED] {meta['file']} | {reason} | duration={meta['duration_s']}s "
-                  f"| motion={peak_motion_pct}% audio={peak_audio_pct}% | {meta['size_bytes'] // 1024} KB")
+            async with self.recordings_lock:
+                meta = await asyncio.to_thread(
+                    mux_event_sync, stem, started_at, chunks, next_frame_us,
+                    peak_motion_pct, peak_audio_pct, reason, peak_jpeg
+                )
+                self.events.append(meta)
+                print(f"[EVENT SAVED] {meta['file']} | {reason} | duration={meta['duration_s']}s "
+                      f"| motion={peak_motion_pct}% audio={peak_audio_pct}% | {meta['size_bytes'] // 1024} KB")
+                await self.cleanup()
         except Exception as e:
             print(f"[EVENT ERROR] {stem.name}: {e}")
+    async def cleanup(self):
+        try:
+            removed = await asyncio.to_thread(cleanup_recordings, self.settings)
+        except OSError as exc:
+            print(f"[CLEANUP] 無法掃描錄影目錄: {exc}")
+            removed = 0
+        self.events = [event for event in self.events if (EVENTS_DIR / event["file"]).is_file()]
+        if removed:
+            print(f"[CLEANUP] 已清理 {removed} 個錄影檔案")
+
+    def update_settings(self, **changes):
+        settings = self.settings.model_copy(update=changes)
+        try:
+            save_settings(settings)
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="無法儲存監控設定") from exc
+        self.settings = settings
 
 
 state = StreamState()
@@ -507,7 +580,7 @@ async def handle_esp32(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     state.peer = peer
     state.writer = writer
 
-    writer.write(b"1" if state.monitoring_enabled else b"0")
+    writer.write(b"1" if state.settings.monitoring_enabled else b"0")
     await writer.drain()
 
     try:
@@ -550,25 +623,25 @@ async def handle_esp32(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
 
 async def periodic_cleanup_loop():
     while True:
-        removed = await asyncio.to_thread(cleanup_old_recordings, state.retention_days)
-        if removed:
-            valid_files = {p.name for p in EVENTS_DIR.glob("evt_*.mp4")}
-            state.events = [e for e in state.events if e["file"] in valid_files]
-            print(f"[CLEANUP] Removed {removed} expired files (> {state.retention_days} days)")
         await asyncio.sleep(3600)
+        async with state.recordings_lock:
+            await state.cleanup()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     EVENTS_DIR.mkdir(parents=True, exist_ok=True)
+    state.settings = load_settings()
+    state.recordings_lock = asyncio.Lock()
     state.frame_cond = asyncio.Condition()
     state.events = load_existing_events()
     if state.events:
         nums = [int(e["id"].rsplit("_", 1)[-1]) for e in state.events if "_" in e["id"]]
         state.evt_counter = max(nums, default=0)
+    await state.cleanup()
     cleanup_task = asyncio.create_task(periodic_cleanup_loop())
-    tcp_server = await asyncio.start_server(handle_esp32, "0.0.0.0", TCP_PORT)
-    print(f"[SERVER] Dashboard http://localhost:8000 | ESP32 TCP 0.0.0.0:{TCP_PORT} "
+    tcp_server = await asyncio.start_server(handle_esp32, TCP_HOST, TCP_PORT)
+    print(f"[SERVER] ESP32 TCP {TCP_HOST}:{TCP_PORT} "
           f"| {len(state.events)} historical events")
     async with tcp_server:
         yield
@@ -593,20 +666,21 @@ async def get_status():
     return {
         "connected": state.connected,
         "peer": state.peer,
-        "monitoring_enabled": state.monitoring_enabled,
+        "monitoring_enabled": state.settings.monitoring_enabled,
         "recording_event": state.active_event is not None,
-        "trigger_mode": state.trigger_mode,
+        "trigger_mode": state.settings.trigger_mode,
         "live_motion_pct": state.live_motion_pct,
-        "motion_threshold_pct": state.motion_threshold_pct,
+        "motion_threshold_pct": state.settings.motion_threshold_pct,
         "live_audio_pct": state.live_audio_pct,
-        "audio_threshold_pct": state.audio_threshold_pct,
+        "audio_threshold_pct": state.settings.audio_threshold_pct,
         "last_motion_at": state.last_motion_at,
         "seq_gaps": state.seq_gaps,
         "crc_errors": state.crc_errors,
         "quiet_chunks_skipped": state.quiet_chunks_skipped,
         "events_count": len(state.events),
         "latest_event": state.events[-1] if state.events else None,
-        "retention_days": state.retention_days,
+        "retention_days": state.settings.retention_days,
+        "max_recording_gb": state.settings.max_recording_gb,
         "esp32": state.esp_stat,
     }
 
@@ -620,21 +694,22 @@ async def list_events():
 async def delete_event(event_id: str):
     if not SAFE_EVENT_ID.match(event_id):
         raise HTTPException(status_code=400, detail="Invalid event_id")
-    removed = False
-    for ext in (".mp4", ".jpg", ".json"):
-        p = EVENTS_DIR / f"{event_id}{ext}"
-        if p.exists():
-            p.unlink()
-            removed = True
-    state.events = [e for e in state.events if e["id"] != event_id]
-    if not removed:
-        raise HTTPException(status_code=404, detail="Event not found")
-    return {"deleted": event_id}
+    async with state.recordings_lock:
+        removed = False
+        for ext in (".mp4", ".jpg", ".json"):
+            p = EVENTS_DIR / f"{event_id}{ext}"
+            if p.exists():
+                p.unlink()
+                removed = True
+        state.events = [e for e in state.events if e["id"] != event_id]
+        if not removed:
+            raise HTTPException(status_code=404, detail="Event not found")
+        return {"deleted": event_id}
 
 
 @app.post("/api/monitoring")
 async def set_monitoring(enabled: bool = Query(...)):
-    state.monitoring_enabled = enabled
+    state.update_settings(monitoring_enabled=enabled)
     if not enabled:
         state.flush_and_reset()
     if state.writer is not None:
@@ -643,7 +718,7 @@ async def set_monitoring(enabled: bool = Query(...)):
             await state.writer.drain()
         except Exception:
             pass
-    return JSONResponse({"monitoring_enabled": state.monitoring_enabled})
+    return JSONResponse({"monitoring_enabled": state.settings.monitoring_enabled})
 
 
 @app.post("/api/trigger_config")
@@ -652,27 +727,25 @@ async def set_trigger_config(
     motion_pct: float | None = Query(default=None, ge=0.5, le=30.0),
     audio_pct: float | None = Query(default=None, ge=0.5, le=50.0),
     retention_days: int | None = Query(default=None, ge=1, le=30),
+    max_recording_gb: float | None = Query(default=None, gt=0, allow_inf_nan=False),
 ):
-    if mode is not None:
-        if mode not in VALID_TRIGGER_MODES:
-            raise HTTPException(status_code=400, detail="Invalid trigger mode")
-        state.trigger_mode = mode
-    if motion_pct is not None:
-        state.motion_threshold_pct = round(motion_pct, 1)
-    if audio_pct is not None:
-        state.audio_threshold_pct = round(audio_pct, 1)
-    if retention_days is not None:
-        state.retention_days = retention_days
-        removed = await asyncio.to_thread(cleanup_old_recordings, state.retention_days)
-        if removed:
-            valid_files = {p.name for p in EVENTS_DIR.glob("evt_*.mp4")}
-            state.events = [e for e in state.events if e["file"] in valid_files]
-    return {
-        "trigger_mode": state.trigger_mode,
-        "motion_threshold_pct": state.motion_threshold_pct,
-        "audio_threshold_pct": state.audio_threshold_pct,
-        "retention_days": state.retention_days,
+    if mode is not None and mode not in {"video", "audio", "either", "both"}:
+        raise HTTPException(status_code=400, detail="Invalid trigger mode")
+    changes = {
+        "trigger_mode": mode,
+        "motion_threshold_pct": round(motion_pct, 1) if motion_pct is not None else None,
+        "audio_threshold_pct": round(audio_pct, 1) if audio_pct is not None else None,
+        "retention_days": retention_days,
+        "max_recording_gb": max_recording_gb,
     }
+    changes = {key: value for key, value in changes.items() if value is not None}
+    if retention_days is not None or max_recording_gb is not None:
+        async with state.recordings_lock:
+            state.update_settings(**changes)
+            await state.cleanup()
+    elif changes:
+        state.update_settings(**changes)
+    return state.settings.model_dump(exclude={"monitoring_enabled"})
 
 
 @app.websocket("/ws/live")
@@ -680,7 +753,7 @@ async def ws_live(ws: WebSocket):
     await ws.accept()
     q: asyncio.Queue = asyncio.Queue(maxsize=16)
     state.ws_queues.add(q)
-    if state.latest_jpeg is not None and state.monitoring_enabled:
+    if state.latest_jpeg is not None and state.settings.monitoring_enabled:
         await ws.send_bytes(b"\x02" + state.latest_jpeg)
     try:
         while True:

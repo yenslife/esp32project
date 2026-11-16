@@ -1,5 +1,7 @@
 # Secrets & local config
 include/secrets.h
+/config.json
+/.config-*.tmp
 .env
 .env.*
 !.env.example

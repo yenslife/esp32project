@@ -8,6 +8,12 @@
 #include "esp_rom_crc.h"
 #include "esp_timer.h"
 #include "secrets.h"
+#if __has_include("ingest_secrets.h")
+#include "ingest_secrets.h"
+#include <atomic>
+#include "esp_websocket_client.h"
+#include <time.h>
+#endif
 
 // XIAO ESP32S3 Sense 鏡頭腳位
 #define PWDN_GPIO_NUM  -1
@@ -30,8 +36,9 @@
 constexpr uint32_t SAMPLE_RATE  = 16000;
 constexpr size_t   AUDIO_CHUNK  = 4096;               // ~128ms PCM
 constexpr int64_t  FRAME_INT_US = 125000;             // 8 FPS（兼顧畫質與 2.4GHz Wi-Fi 穩定度）
-constexpr int      JPEG_QUALITY = 15;                 // VGA 約 10–13 KB/張
-constexpr size_t   RING_SIZE    = 4 * 1024 * 1024;    // 4 MB PSRAM Ring Buffer（可緩衝約 30 秒網路抖動）
+constexpr int      JPEG_QUALITY = 22;                 // 數字越大，JPEG 壓縮越高
+constexpr size_t   RING_SIZE    = 4 * 1024 * 1024;    // 4 MB PSRAM Ring Buffer
+constexpr int64_t  MAX_QUEUE_AGE_US = 750000;         // 丟棄等待太久的封包，讓畫面追上現場
 constexpr size_t   MAX_REC_SIZE = 128 * 1024;         // 單筆封包暫存上限
 
 enum RecType : uint8_t { REC_AUDIO = 1, REC_FRAME = 2, REC_STAT = 3 };
@@ -112,34 +119,39 @@ bool pushRecord(uint8_t type, int64_t tUs, const uint8_t* payload, uint32_t len)
 // 從 Ring Buffer 一次取出一整筆完整封包到 txStageBuf，確保斷線重連永遠對齊封包邊界
 bool popWholeRecord() {
     if (xSemaphoreTake(ringMux, pdMS_TO_TICKS(10)) != pdTRUE) return false;
-    if (ringUsed < sizeof(PacketHdr)) {
-        xSemaphoreGive(ringMux);
-        return false;
-    }
 
-    PacketHdr hdr;
-    size_t savedTail = ringTail, savedUsed = ringUsed;
-    ringReadRaw((uint8_t*)&hdr, sizeof(hdr));
-    const size_t total = sizeof(PacketHdr) + hdr.len + sizeof(uint32_t);
-    if (hdr.magic[0] != 0xA5 || hdr.magic[1] != 0x5A || total > MAX_REC_SIZE || savedUsed < total) {
-        // 若異常失步則清空緩衝區重新開始
-        if (hdr.magic[0] != 0xA5 || hdr.magic[1] != 0x5A || total > MAX_REC_SIZE) {
+    const int64_t oldestAllowedUs = esp_timer_get_time() - MAX_QUEUE_AGE_US;
+    while (ringUsed >= sizeof(PacketHdr)) {
+        PacketHdr hdr;
+        ringReadRaw((uint8_t*)&hdr, sizeof(hdr));
+        const size_t bodySize = hdr.len + sizeof(uint32_t);
+        const size_t total = sizeof(hdr) + bodySize;
+        if (hdr.magic[0] != 0xA5 || hdr.magic[1] != 0x5A ||
+            total > MAX_REC_SIZE || bodySize > ringUsed) {
+            // 寫入端會在鎖內放入完整封包。資料異常時清空緩衝區。
             ringHead = ringTail = ringUsed = 0;
-        } else {
-            ringTail = savedTail;
-            ringUsed = savedUsed;
+            break;
         }
+        const int64_t capturedUntilUs = hdr.type == REC_AUDIO
+            ? hdr.t_us + (int64_t)(hdr.len / 2) * 1000000LL / SAMPLE_RATE
+            : hdr.t_us;
+        if (capturedUntilUs < oldestAllowedUs) {
+            ringTail = (ringTail + bodySize) % RING_SIZE;
+            ringUsed -= bodySize;
+            ringDropped = ringDropped + 1;
+            continue;
+        }
+
+        memcpy(txStageBuf, &hdr, sizeof(hdr));
+        ringReadRaw(txStageBuf + sizeof(hdr), bodySize);
         xSemaphoreGive(ringMux);
-        return false;
+        txStageLen = total;
+        txStagePos = 0;
+        return true;
     }
 
-    memcpy(txStageBuf, &hdr, sizeof(hdr));
-    ringReadRaw(txStageBuf + sizeof(hdr), hdr.len + sizeof(uint32_t));
     xSemaphoreGive(ringMux);
-
-    txStageLen = total;
-    txStagePos = 0;
-    return true;
+    return false;
 }
 
 // Core 0：高優先權連續讀取 PDM 麥克風，不因網路或攝影機阻塞
@@ -200,7 +212,11 @@ bool initCamera() {
     c.pin_pwdn = PWDN_GPIO_NUM; c.pin_reset = RESET_GPIO_NUM;
     c.xclk_freq_hz = 20000000;
     c.pixel_format = PIXFORMAT_JPEG;
+#ifdef ESP32_INGEST_HOST
+    c.frame_size   = FRAMESIZE_QVGA;
+#else
     c.frame_size   = FRAMESIZE_VGA;
+#endif
     c.jpeg_quality = JPEG_QUALITY;
     c.fb_count     = 2;
     c.fb_location  = CAMERA_FB_IN_PSRAM;
@@ -230,10 +246,82 @@ void ensureWiFi() {
     }
 }
 
-WiFiClient client;
 int64_t lastStatUs = 0;
+#ifdef ESP32_INGEST_HOST
+esp_websocket_client_handle_t cameraSocket = nullptr;
+std::atomic<int> pendingMonitorCommand{0};
+bool timeSyncStarted = false;
+#else
+WiFiClient client;
 uint32_t lastConnectTryMs = 0;
 bool useFallbackHost = false;
+#endif
+
+void setMonitoring(int command) {
+    if (command == '1' && !monitoringEnabled) {
+        if (xSemaphoreTake(ringMux, pdMS_TO_TICKS(20)) == pdTRUE) {
+            ringHead = ringTail = ringUsed = 0;
+            xSemaphoreGive(ringMux);
+        }
+        txStageLen = txStagePos = 0;
+        monitoringEnabled = true;
+        Serial.println("Monitoring: ON");
+    } else if (command == '0' && monitoringEnabled) {
+        monitoringEnabled = false;
+        Serial.println("Monitoring: OFF");
+    }
+}
+
+#ifdef ESP32_INGEST_HOST
+bool connectIngest() {
+    if (!timeSyncStarted) {
+        configTime(0, 0, "time.cloudflare.com", "time.google.com", "pool.ntp.org");
+        timeSyncStarted = true;
+    }
+    // TLS 驗證需要正確的時間，等待 SNTP 校時。
+    if (time(nullptr) < 1735689600) return false;
+    if (!cameraSocket) {
+        esp_websocket_client_config_t config = {};
+        config.uri = "wss://" ESP32_INGEST_HOST ESP32_INGEST_PATH;
+        config.cert_pem = ESP32_INGEST_CA;
+        config.subprotocol = "esp32-ingest-v1";
+        config.headers = "X-ESP32-Token: " ESP32_INGEST_TOKEN "\r\n";
+        config.reconnect_timeout_ms = 2000;
+        config.network_timeout_ms = 2500;
+        config.enable_close_reconnect = true;
+        cameraSocket = esp_websocket_client_init(&config);
+        if (!cameraSocket) return false;
+
+        esp_err_t error = esp_websocket_register_events(
+            cameraSocket, WEBSOCKET_EVENT_ANY,
+            [](void*, esp_event_base_t, int32_t event, void* data) {
+                const auto* message = static_cast<const esp_websocket_event_data_t*>(data);
+                if (event == WEBSOCKET_EVENT_CONNECTED) {
+                    Serial.println("WSS ingest connected");
+                } else if (event == WEBSOCKET_EVENT_DISCONNECTED) {
+                    Serial.println("WSS ingest disconnected");
+                } else if (event == WEBSOCKET_EVENT_ERROR) {
+                    Serial.printf("WSS error type=%d TLS=%d socket=%d HTTP=%d\n",
+                                  message->error_handle.error_type,
+                                  message->error_handle.esp_tls_stack_err,
+                                  message->error_handle.esp_transport_sock_errno,
+                                  message->error_handle.esp_ws_handshake_status_code);
+                } else if (event == WEBSOCKET_EVENT_DATA && message->op_code == 2 &&
+                           message->payload_len == 1 && message->data_len == 1) {
+                    pendingMonitorCommand.store(message->data_ptr[0]);
+                }
+            }, nullptr
+        );
+        if (error != ESP_OK || esp_websocket_client_start(cameraSocket) != ESP_OK) {
+            esp_websocket_client_destroy(cameraSocket);
+            cameraSocket = nullptr;
+            return false;
+        }
+    }
+    setMonitoring(pendingMonitorCommand.exchange(0));
+    return esp_websocket_client_is_connected(cameraSocket);
+}
+#endif
 
 void setup() {
     Serial.begin(115200);
@@ -276,6 +364,12 @@ void loop() {
         return;
     }
 
+#ifdef ESP32_INGEST_HOST
+    if (!connectIngest()) {
+        delay(20);
+        return;
+    }
+#else
     if (!client.connected()) {
         // 若上一筆送一半斷線，重設起點讓重連後重送完整封包
         txStagePos = 0;
@@ -295,21 +389,8 @@ void loop() {
     }
 
     // 接收伺服器下發的監控開關（'1'=開啟, '0'=暫停）
-    while (client.available()) {
-        int c = client.read();
-        if (c == '1' && !monitoringEnabled) {
-            if (xSemaphoreTake(ringMux, pdMS_TO_TICKS(20)) == pdTRUE) {
-                ringHead = ringTail = ringUsed = 0;
-                xSemaphoreGive(ringMux);
-            }
-            txStageLen = txStagePos = 0;
-            monitoringEnabled = true;
-            Serial.println("Monitoring: ON");
-        } else if (c == '0' && monitoringEnabled) {
-            monitoringEnabled = false;
-            Serial.println("Monitoring: OFF");
-        }
-    }
+    while (client.available()) setMonitoring(client.read());
+#endif
 
     // 每 5 秒送出一筆狀態封包並在 Serial 印出摘要
     int64_t nowUs = esp_timer_get_time();
@@ -331,7 +412,7 @@ void loop() {
         Serial.printf("STAT %s\n", statJson);
     }
 
-    // 傳送暫存封包（每次最多寫 16KB，避免長時間卡住 loop）
+    // 取出一筆完整封包。TCP 模式分段寫入，WSS 模式每個訊息送一筆。
     if (txStagePos >= txStageLen) {
         if (!popWholeRecord()) {
             delay(2);
@@ -339,6 +420,16 @@ void loop() {
         }
     }
 
+#ifdef ESP32_INGEST_HOST
+    const int sent = esp_websocket_client_send_bin(
+        cameraSocket, reinterpret_cast<const char*>(txStageBuf),
+        txStageLen, pdMS_TO_TICKS(500)
+    );
+    if (sent != static_cast<int>(txStageLen)) {
+        Serial.printf("WSS send failed (%u bytes)\n", (unsigned)txStageLen);
+    }
+    txStagePos = txStageLen;
+#else
     size_t remain = txStageLen - txStagePos;
     size_t chunk = min(remain, (size_t)16384);
     int written = client.write(txStageBuf + txStagePos, chunk);
@@ -348,4 +439,5 @@ void loop() {
         client.stop();
         txStagePos = 0;
     }
+#endif
 }

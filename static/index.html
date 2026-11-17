@@ -87,6 +87,7 @@
     }
     .card-head {
       display: flex;
+      flex-wrap: wrap;
       justify-content: space-between;
       align-items: center;
       gap: 10px;
@@ -96,6 +97,19 @@
     }
     .muted { color: var(--muted); font-size: 12px; font-weight: 400; text-decoration: none; }
     a.muted:hover { color: var(--text); text-decoration: underline; }
+    .rotation-control {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .rotation-control select {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 4px 7px;
+      font: inherit;
+    }
 
     .viewport {
       position: relative;
@@ -106,14 +120,23 @@
       overflow: hidden;
       border: 1px solid var(--border);
     }
-    canvas, video {
+    .viewport > canvas, .viewport > video {
+      position: absolute;
+      top: 50%;
+      left: 50%;
       width: 100%;
       height: 100%;
       display: block;
       object-fit: contain;
       background: #000;
+      transform: translate(-50%, -50%) rotate(var(--view-rotation, 0deg));
     }
-    video { display: none; }
+    .viewport[data-sideways] { aspect-ratio: 3 / 4; }
+    .viewport[data-sideways] > canvas, .viewport[data-sideways] > video {
+      width: calc(100% * 4 / 3);
+      height: 75%;
+    }
+    .viewport > video { display: none; }
     .overlay-badges {
       position: absolute;
       top: 10px;
@@ -301,9 +324,18 @@
             <a id="downloadLink" class="muted" href="#" download>下載 MP4</a>
             <button id="btnBackLive" type="button" class="btn-back">← 返回即時畫面</button>
           </div>
+          <label class="muted rotation-control">
+            旋轉畫面
+            <select id="viewRotation">
+              <option value="0">0°</option>
+              <option value="90">90°</option>
+              <option value="180">180°</option>
+              <option value="270">270°</option>
+            </select>
+          </label>
         </div>
 
-        <div class="viewport">
+        <div id="cameraViewport" class="viewport">
           <canvas id="liveCanvas" width="640" height="480"></canvas>
           <video id="eventVideo" controls playsinline></video>
           <div id="liveOverlays" class="overlay-badges">
@@ -372,6 +404,8 @@
   <script>
     const canvas = document.getElementById("liveCanvas");
     const ctx = canvas.getContext("2d");
+    const cameraViewport = document.getElementById("cameraViewport");
+    const viewRotation = document.getElementById("viewRotation");
     const connDot = document.getElementById("connDot");
     const connText = document.getElementById("connText");
     const espStats = document.getElementById("espStats");
@@ -416,6 +450,13 @@
     let audioEnabled = false;
     let audioCtx = null;
     let nextPlayTime = 0;
+
+    function applyViewRotation(angle) {
+      const rotation = ["0", "90", "180", "270"].includes(angle) ? angle : "0";
+      viewRotation.value = rotation;
+      cameraViewport.style.setProperty("--view-rotation", `${rotation}deg`);
+      cameraViewport.toggleAttribute("data-sideways", rotation === "90" || rotation === "270");
+    }
 
     function toggleLiveAudio() {
       audioEnabled = !audioEnabled;
@@ -674,6 +715,19 @@
     }
 
     btnBackLive.addEventListener("click", backToLive);
+    try {
+      applyViewRotation(localStorage.getItem("camera-view-rotation"));
+    } catch {
+      applyViewRotation("0");
+    }
+    viewRotation.addEventListener("change", () => {
+      applyViewRotation(viewRotation.value);
+      try {
+        localStorage.setItem("camera-view-rotation", viewRotation.value);
+      } catch {
+        // 瀏覽器禁止本機儲存時，這次的角度仍有效。
+      }
+    });
 
     btnMonitor.addEventListener("click", async () => {
       const next = !monitoringEnabled;

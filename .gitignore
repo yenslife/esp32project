@@ -1,5 +1,6 @@
 # Secrets & local config
 include/secrets.h
+include/ingest_secrets.h
 /config.json
 /.config-*.tmp
 .env

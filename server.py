@@ -2,6 +2,7 @@
 from array import array
 import asyncio
 from contextlib import asynccontextmanager
+import hmac
 from dataclasses import dataclass, field
 from datetime import datetime
 import io
@@ -27,6 +28,8 @@ from pydantic import BaseModel, Field, ValidationError
 
 TCP_HOST = os.environ.get("ESP32_TCP_HOST", "0.0.0.0")
 TCP_PORT = 9000
+INGEST_PROTOCOL = "esp32-ingest-v1"
+MAX_INGEST_PACKET = 128 * 1024
 SAMPLE_RATE = 16000
 
 CHUNK_US = 5_000_000          # 5 秒切塊：平時僅保留最新 1 塊作 Pre-roll
@@ -750,6 +753,9 @@ async def set_trigger_config(
 
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket):
+    if INGEST_PROTOCOL in ws.scope["subprotocols"]:
+        await ws_ingest(ws)
+        return
     await ws.accept()
     q: asyncio.Queue = asyncio.Queue(maxsize=16)
     state.ws_queues.add(q)
@@ -763,6 +769,71 @@ async def ws_live(ws: WebSocket):
         pass
     finally:
         state.ws_queues.discard(q)
+
+
+@app.websocket("/ingest")
+async def ws_ingest(ws: WebSocket):
+    expected_token = os.environ.get("ESP32_INGEST_TOKEN", "").encode()
+    supplied_token = ws.headers.get("x-esp32-token", "").encode()
+    if (
+        INGEST_PROTOCOL not in ws.scope["subprotocols"]
+        or not expected_token
+        or not hmac.compare_digest(expected_token, supplied_token)
+    ):
+        await ws.close(code=1008)
+        return
+
+    tcp_host = "127.0.0.1" if TCP_HOST == "0.0.0.0" else TCP_HOST
+    try:
+        reader, writer = await asyncio.open_connection(tcp_host, TCP_PORT)
+    except OSError:
+        await ws.close(code=1013)
+        return
+
+    async def send_controls():
+        while control := await reader.read(1):
+            await ws.send_bytes(control)
+
+    async def receive_packets():
+        while True:
+            message = await asyncio.wait_for(ws.receive(), timeout=30)
+            if message["type"] == "websocket.disconnect":
+                print(f"[INGEST] WebSocket disconnected (code={message.get('code')})")
+                return
+            packet = message.get("bytes")
+            if packet is None:
+                await ws.close(code=1003)
+                return
+            if not PKT_HDR.size + 4 <= len(packet) <= MAX_INGEST_PACKET:
+                print(f"[INGEST] Invalid message size: {len(packet)}")
+                await ws.close(code=1009)
+                return
+            _, _, _, _, length = PKT_HDR.unpack_from(packet)
+            if len(packet) != PKT_HDR.size + length + 4:
+                print(f"[INGEST] Message length mismatch: actual={len(packet)}, payload={length}")
+                await ws.close(code=1002)
+                return
+            writer.write(packet)
+            await writer.drain()
+
+    try:
+        await ws.accept(subprotocol=INGEST_PROTOCOL)
+        async with asyncio.TaskGroup() as group:
+            upstream = group.create_task(receive_packets())
+            downstream = group.create_task(send_controls())
+            _, pending = await asyncio.wait(
+                (upstream, downstream), return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+    except* (WebSocketDisconnect, OSError, TimeoutError):
+        pass
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except OSError:
+            pass
 
 
 @app.get("/api/live")

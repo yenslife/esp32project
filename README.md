@@ -4,7 +4,7 @@
 
 ## 核心功能
 
-- **連續擷取與 Wi-Fi 串流**：ESP32 以 4 MB PSRAM Ring Buffer 解耦影音擷取與網路傳送，斷線自動重連不掉封包。
+- **連續擷取與 Wi-Fi 串流**：ESP32 以 PSRAM Ring Buffer 解耦影音擷取與網路傳送。網路壅塞時，韌體會跳過等待超過約 0.75 秒的佇列封包，讓即時畫面盡快追上現場。被跳過的影音也會從這段錄影中略去。
 - **輕量動態偵測**：伺服器將影格縮小為 `80×60` 灰階模糊圖計算相鄰影格差異（`< 0.1 ms/張`，無須安裝肥大的 OpenCV）。
 - **前後緩衝事件錄影**：平時零硬碟寫入，僅在記憶體滾動保留最近 5 秒緩衝；偵測到動靜時，自動合併「**事件前 5 秒 + 動態期間 + 事件後 5 秒**」轉碼為單支 H.264 + AAC MP4（含高通濾波消除麥克風直流偏移）。
 - **Web Dashboard（`http://localhost:8000`）**：
@@ -12,6 +12,7 @@
   - **監控模式 ON / OFF**（即時下發同步回 ESP32）
   - 即時變動比例條與靈敏度門檻滑桿
   - 歷史事件縮圖牆、內建播放器、單筆刪除
+  - 即時畫面與事件回放可順時針旋轉 0°、90°、180°、270°，角度儲存在目前的瀏覽器
 - **錄影自動清理**：預設保留 7 天，整個 `recordings/` 目錄以 10 GB 為上限。超過容量時，從最舊的錄影開始清理，事件影片、縮圖與紀錄會一起刪除。
 
 ## 快速啟動
@@ -53,6 +54,14 @@ curl -f -X POST 'http://localhost:8000/api/trigger_config?max_recording_gb=5'
 ## VM 反向代理
 
 若 Nginx 與伺服器在同一台 VM，將 Dashboard 的上游設為 `127.0.0.1:8000`，並為 `/ws/live` 啟用 WebSocket 轉送。ESP32 的影音使用獨立的 TCP 連接埠 `9000`。可用 `ESP32_TCP_HOST` 設定 TCP 監聽位址，例如設成 `127.0.0.1`，再透過本機轉送服務接入。
+
+### ESP32 透過 WSS 直接上傳
+
+1. 為 VM 服務設定 `ESP32_INGEST_TOKEN`，使用每台攝影機部署時產生的隨機 token。Nginx 將 `/ingest` 以與 `/ws/live` 相同的 WebSocket 設定轉送給 VM。若反向代理已轉送 `/ws/live`，也可用這個路徑上傳，伺服器會用 WebSocket 子協定辨識攝影機。
+2. 將 `include/ingest_secrets.example.h` 複製成 `include/ingest_secrets.h`，填入 HTTPS 網域、路徑、相同的 token，以及簽發站台憑證的根 CA PEM。此檔案已加入忽略規則。Wi‑Fi 帳密仍設定於 `include/secrets.h`。
+3. 使用 USB 執行 `pio run -t upload`。序列監控顯示 `WSS ingest connected` 後，到 Dashboard 確認即時畫面。Wi‑Fi 需能連到站台的 443 埠，並讓 ESP32 透過 SNTP 校時。
+
+韌體有 `include/ingest_secrets.h` 時使用 Espressif 的 WebSocket 用戶端，以 QVGA（320 × 240）串流來降低直連頻寬。原有 TCP 模式維持 VGA。VM 的 `9000` 可只監聽本機。
 
 ## 目錄結構
 

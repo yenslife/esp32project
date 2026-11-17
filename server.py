@@ -4,7 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import hmac
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 import io
 import json
 import math
@@ -45,6 +45,8 @@ DEFAULT_AUDIO_PCT = 3.5       # 預設聲音變化門檻（%）
 AUDIO_MIN_CHUNKS = 2          # 持續聲音至少 2 個 chunk（~256ms），或單次拍手 >= 2 倍門檻
 
 TriggerMode = Literal["video", "audio", "either", "both", "continuous"]
+CameraProfile = Literal["smooth", "detail"]
+CAMERA_PROFILE_COMMANDS: dict[CameraProfile, bytes] = {"smooth": b"Q", "detail": b"V"}
 CONFIG_PATH = Path("config.json")
 
 REC_AUDIO = 1
@@ -70,10 +72,9 @@ class MotionDetector:
     def reset(self):
         self.prev_gray = None
 
-    def score(self, jpeg_bytes: bytes) -> float:
+    def score(self, image: Image.Image) -> float:
         gray = (
-            Image.open(io.BytesIO(jpeg_bytes))
-            .convert("L")
+            image.convert("L")
             .resize((80, 60), Image.Resampling.BILINEAR)
             .filter(ImageFilter.BoxBlur(1))
         )
@@ -207,7 +208,7 @@ def mux_event_sync(stem_path: Path, started_at: datetime, chunks: list[MediaChun
         "video_url": f"/recordings/events/{mp4_path.name}",
         "thumb_url": f"/recordings/events/{jpg_path.name}" if peak_jpeg else None,
         "started_at": started_at.isoformat(timespec="seconds"),
-        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "frames": len(frames),
         "fps": round(len(frames) / video_dur_s, 2) if video_dur_s > 0 else 0,
         "duration_s": round(max(video_dur_s, audio_dur_s), 2),
@@ -216,6 +217,8 @@ def mux_event_sync(stem_path: Path, started_at: datetime, chunks: list[MediaChun
         "av_offset_ms": round(offset_s * 1000, 2),
         "peak_motion_pct": peak_motion_pct,
         "peak_audio_pct": peak_audio_pct,
+        "motion_detected": any(chunk.video_triggered for chunk in chunks),
+        "audio_detected": any(chunk.audio_triggered for chunk in chunks),
         "trigger_reason": trigger_reason,
         "chunks": len(chunks),
         "size_bytes": mp4_path.stat().st_size,
@@ -227,6 +230,7 @@ def mux_event_sync(stem_path: Path, started_at: datetime, chunks: list[MediaChun
 class Settings(BaseModel):
     monitoring_enabled: bool = True
     trigger_mode: TriggerMode = "either"
+    camera_profile: CameraProfile = "smooth"
     motion_threshold_pct: float = Field(DEFAULT_MOTION_PCT, ge=0.5, le=30)
     audio_threshold_pct: float = Field(DEFAULT_AUDIO_PCT, ge=0.5, le=50)
     retention_days: int = Field(7, ge=1, le=30)
@@ -306,6 +310,14 @@ def load_existing_events() -> list[dict]:
         try:
             meta = json.loads(jf.read_text())
             if (EVENTS_DIR / meta["file"]).exists():
+                for field_name in ("started_at", "created_at"):
+                    if isinstance(meta.get(field_name), str):
+                        try:
+                            # 舊版使用伺服器的本機時間，且未寫入時區。
+                            timestamp = datetime.fromisoformat(meta[field_name])
+                            meta[field_name] = timestamp.astimezone(timezone.utc).isoformat(timespec="seconds")
+                        except ValueError:
+                            pass
                 items.append(meta)
         except Exception:
             pass
@@ -321,6 +333,7 @@ class StreamState:
         self.recordings_lock = asyncio.Lock()
 
         self.latest_jpeg: bytes | None = None
+        self.frame_size: tuple[int, int] | None = None
         self.frame_seq = 0
         self.frame_cond: asyncio.Condition | None = None
         self.ws_queues: set[asyncio.Queue] = set()
@@ -371,7 +384,7 @@ class StreamState:
             end_us = max(self.frames_buf[-1][0],
                          last_audio_us + len(last_pcm) // 2 * 1_000_000 // SAMPLE_RATE)
             self._process_media_chunk(
-                self.chunk_start_us, end_us, self.chunk_wall_time or datetime.now(),
+                self.chunk_start_us, end_us, self.chunk_wall_time or datetime.now(timezone.utc),
                 self.frames_buf.copy(), self.audio_buf.copy(), None
             )
         if self.active_event and self.active_event.chunks:
@@ -398,12 +411,17 @@ class StreamState:
 
     def add_media(self, rtype: int, t_us: int, payload: bytes):
         if rtype == REC_FRAME:
+            with Image.open(io.BytesIO(payload)) as image:
+                if self.frame_size is not None and self.frame_size != image.size:
+                    # FFmpeg 的每段錄影使用單一解析度。
+                    self.flush_and_reset()
+                self.frame_size = image.size
+                score = self.detector.score(image)
             self.latest_jpeg = payload
             self.frame_seq += 1
-            score = self.detector.score(payload)
             self.live_motion_pct = score
             if score >= self.settings.motion_threshold_pct:
-                self.last_motion_at = datetime.now().isoformat(timespec="seconds")
+                self.last_motion_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
             self.frames_buf.append((t_us, payload, score))
             self._broadcast_ws(b"\x02" + payload)
         elif rtype == REC_AUDIO:
@@ -414,7 +432,7 @@ class StreamState:
 
         if self.chunk_start_us is None and self.frames_buf and self.audio_buf:
             self.chunk_start_us = min(self.frames_buf[0][0], self.audio_buf[0][0])
-            self.chunk_wall_time = datetime.now()
+            self.chunk_wall_time = datetime.now(timezone.utc)
 
         self._try_emit_chunks()
 
@@ -450,11 +468,11 @@ class StreamState:
                         right = pcm[split_byte:]
                         rem_audio.append((cut_us, right, calc_audio_level_pct(right)))
 
-            wall = self.chunk_wall_time or datetime.now()
+            wall = self.chunk_wall_time or datetime.now(timezone.utc)
             start_us = self.chunk_start_us
             self.audio_buf = rem_audio
             self.chunk_start_us = cut_us
-            self.chunk_wall_time = datetime.now()
+            self.chunk_wall_time = datetime.now(timezone.utc)
 
             if not c_frames or not c_audio:
                 continue
@@ -604,11 +622,12 @@ async def handle_esp32(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
     state.connected = True
     state.peer = peer
     state.writer = writer
-
-    writer.write(b"1" if state.settings.monitoring_enabled else b"0")
-    await writer.drain()
+    state.esp_stat = {}
 
     try:
+        monitoring_command = b"1" if state.settings.monitoring_enabled else b"0"
+        writer.write(monitoring_command + CAMERA_PROFILE_COMMANDS[state.settings.camera_profile])
+        await writer.drain()
         while True:
             hdr_bytes = await reader.readexactly(PKT_HDR.size)
             magic, rtype, seq, t_us, length = PKT_HDR.unpack(hdr_bytes)
@@ -699,6 +718,7 @@ async def get_status():
         "monitoring_enabled": state.settings.monitoring_enabled,
         "recording_event": state.active_event is not None,
         "trigger_mode": state.settings.trigger_mode,
+        "camera_profile": state.settings.camera_profile,
         "live_motion_pct": state.live_motion_pct,
         "motion_threshold_pct": state.settings.motion_threshold_pct,
         "live_audio_pct": state.live_audio_pct,
@@ -776,6 +796,19 @@ async def set_trigger_config(
     elif changes:
         state.update_settings(**changes)
     return state.settings.model_dump(exclude={"monitoring_enabled"})
+
+
+@app.post("/api/camera_profile")
+async def set_camera_profile(profile: CameraProfile = Query(...)):
+    state.update_settings(camera_profile=profile)
+    writer = state.writer
+    if writer is not None:
+        try:
+            writer.write(CAMERA_PROFILE_COMMANDS[profile])
+            await writer.drain()
+        except OSError:
+            pass
+    return {"camera_profile": state.settings.camera_profile}
 
 
 @app.websocket("/ws/live")

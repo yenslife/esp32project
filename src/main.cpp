@@ -1,5 +1,6 @@
 // XIAO ESP32S3 Sense 智慧監視器韌體（階段 1：PSRAM Ring Buffer + Wi-Fi 連續影音串流）
 #include <Arduino.h>
+#include <atomic>
 #include <ESP_I2S.h>
 #include <WiFi.h>
 #include "esp_camera.h"
@@ -10,7 +11,6 @@
 #include "secrets.h"
 #if __has_include("ingest_secrets.h")
 #include "ingest_secrets.h"
-#include <atomic>
 #include "esp_websocket_client.h"
 #include <time.h>
 #endif
@@ -35,11 +35,16 @@
 
 constexpr uint32_t SAMPLE_RATE  = 16000;
 constexpr size_t   AUDIO_CHUNK  = 4096;               // ~128ms PCM
-constexpr int64_t  FRAME_INT_US = 125000;             // 8 FPS（兼顧畫質與 2.4GHz Wi-Fi 穩定度）
 constexpr int      JPEG_QUALITY = 22;                 // 數字越大，JPEG 壓縮越高
 constexpr size_t   RING_SIZE    = 4 * 1024 * 1024;    // 4 MB PSRAM Ring Buffer
 constexpr int64_t  MAX_QUEUE_AGE_US = 750000;         // 丟棄等待太久的封包，讓畫面追上現場
 constexpr size_t   MAX_REC_SIZE = 128 * 1024;         // 單筆封包暫存上限
+constexpr int SMOOTH_PROFILE = 'Q';
+constexpr int DETAIL_PROFILE = 'V';
+
+std::atomic<int> pendingCameraProfile{0};
+std::atomic<int> appliedCameraProfile{SMOOTH_PROFILE};
+std::atomic<bool> cameraProfileError{false};
 
 enum RecType : uint8_t { REC_AUDIO = 1, REC_FRAME = 2, REC_STAT = 3 };
 
@@ -135,7 +140,7 @@ bool popWholeRecord() {
         const int64_t capturedUntilUs = hdr.type == REC_AUDIO
             ? hdr.t_us + (int64_t)(hdr.len / 2) * 1000000LL / SAMPLE_RATE
             : hdr.t_us;
-        if (capturedUntilUs < oldestAllowedUs) {
+        if (hdr.type != REC_STAT && capturedUntilUs < oldestAllowedUs) {
             ringTail = (ringTail + bodySize) % RING_SIZE;
             ringUsed -= bodySize;
             ringDropped = ringDropped + 1;
@@ -177,7 +182,27 @@ void audioTask(void*) {
 // Core 1：持續取出 camera fb 避免 FB-OVF，依目標幀率推入 Ring Buffer
 void cameraTask(void*) {
     int64_t nextFrameUs = esp_timer_get_time();
+    int64_t frameIntervalUs = 125000;
+    unsigned settlingFrames = 0;
+    sensor_t* sensor = esp_camera_sensor_get();
     while (true) {
+        const int requested = pendingCameraProfile.exchange(0);
+        if (requested && requested != appliedCameraProfile.load()) {
+            const bool detail = requested == DETAIL_PROFILE;
+            if (sensor->set_framesize(sensor, detail ? FRAMESIZE_VGA : FRAMESIZE_QVGA) == 0) {
+                frameIntervalUs = detail ? 250000 : 125000;
+                nextFrameUs = esp_timer_get_time();
+                settlingFrames = 2;
+                appliedCameraProfile.store(requested);
+                cameraProfileError.store(false);
+            } else {
+                cameraProfileError.store(true);
+                Serial.println("ERROR: camera profile change failed");
+            }
+        } else if (requested) {
+            cameraProfileError.store(false);
+        }
+
         camera_fb_t* fb = esp_camera_fb_get();
         int64_t t = esp_timer_get_time();
         if (!fb) {
@@ -186,8 +211,10 @@ void cameraTask(void*) {
             continue;
         }
 
-        if (monitoringEnabled && t >= nextFrameUs) {
-            nextFrameUs += FRAME_INT_US;
+        if (settlingFrames > 0) {
+            --settlingFrames;
+        } else if (monitoringEnabled && t >= nextFrameUs) {
+            nextFrameUs += frameIntervalUs;
             if (t > nextFrameUs) nextFrameUs = t;
             if (pushRecord(REC_FRAME, t, fb->buf, (uint32_t)fb->len)) {
                 framesSent = framesSent + 1;
@@ -212,16 +239,17 @@ bool initCamera() {
     c.pin_pwdn = PWDN_GPIO_NUM; c.pin_reset = RESET_GPIO_NUM;
     c.xclk_freq_hz = 20000000;
     c.pixel_format = PIXFORMAT_JPEG;
-#ifdef ESP32_INGEST_HOST
-    c.frame_size   = FRAMESIZE_QVGA;
-#else
+    // 先以最大尺寸配置緩衝區，之後由感測器切換解析度。
     c.frame_size   = FRAMESIZE_VGA;
-#endif
     c.jpeg_quality = JPEG_QUALITY;
     c.fb_count     = 2;
     c.fb_location  = CAMERA_FB_IN_PSRAM;
     c.grab_mode    = CAMERA_GRAB_LATEST;
-    return esp_camera_init(&c) == ESP_OK;
+    if (esp_camera_init(&c) != ESP_OK) return false;
+    sensor_t* sensor = esp_camera_sensor_get();
+    if (sensor && sensor->set_framesize(sensor, FRAMESIZE_QVGA) == 0) return true;
+    esp_camera_deinit();
+    return false;
 }
 
 bool initMic() {
@@ -247,6 +275,8 @@ void ensureWiFi() {
 }
 
 int64_t lastStatUs = 0;
+int lastReportedProfile = 0;
+bool lastReportedProfileError = false;
 #ifdef ESP32_INGEST_HOST
 esp_websocket_client_handle_t cameraSocket = nullptr;
 std::atomic<int> pendingMonitorCommand{0};
@@ -308,7 +338,12 @@ bool connectIngest() {
                                   message->error_handle.esp_ws_handshake_status_code);
                 } else if (event == WEBSOCKET_EVENT_DATA && message->op_code == 2 &&
                            message->payload_len == 1 && message->data_len == 1) {
-                    pendingMonitorCommand.store(message->data_ptr[0]);
+                    const int command = message->data_ptr[0];
+                    if (command == SMOOTH_PROFILE || command == DETAIL_PROFILE) {
+                        pendingCameraProfile.store(command);
+                    } else {
+                        pendingMonitorCommand.store(command);
+                    }
                 }
             }, nullptr
         );
@@ -389,27 +424,44 @@ void loop() {
     }
 
     // 接收伺服器下發的監控開關（'1'=開啟, '0'=暫停）
-    while (client.available()) setMonitoring(client.read());
+    while (client.available()) {
+        const int command = client.read();
+        if (command == SMOOTH_PROFILE || command == DETAIL_PROFILE) {
+            pendingCameraProfile.store(command);
+        } else {
+            setMonitoring(command);
+        }
+    }
 #endif
 
-    // 每 5 秒送出一筆狀態封包並在 Serial 印出摘要
+    // 每 5 秒送出狀態，畫質套用結果有變時立即回報。
     int64_t nowUs = esp_timer_get_time();
-    if (nowUs - lastStatUs >= 5000000LL) {
-        lastStatUs = nowUs;
-        char statJson[220];
+    const int cameraProfile = appliedCameraProfile.load();
+    const bool profileError = cameraProfileError.load();
+    if (nowUs - lastStatUs >= 5000000LL ||
+        cameraProfile != lastReportedProfile || profileError != lastReportedProfileError) {
+        char statJson[288];
         int n = snprintf(
             statJson, sizeof(statJson),
             "{\"monitoring\":%s,\"ring_used\":%u,\"ring_size\":%u,"
             "\"ring_dropped\":%lu,\"frames_sent\":%lu,\"chunks_sent\":%lu,"
-            "\"audio_errors\":%lu,\"grab_errors\":%lu,\"rssi\":%d}",
+            "\"audio_errors\":%lu,\"grab_errors\":%lu,\"rssi\":%d,"
+            "\"camera_profile\":\"%s\",\"camera_profile_error\":%s}",
             monitoringEnabled ? "true" : "false",
             (unsigned)ringUsed, (unsigned)RING_SIZE,
             (unsigned long)ringDropped, (unsigned long)framesSent,
             (unsigned long)chunksSent, (unsigned long)audioErrors,
-            (unsigned long)grabErrors, WiFi.RSSI()
+            (unsigned long)grabErrors, WiFi.RSSI(),
+            cameraProfile == DETAIL_PROFILE ? "detail" : "smooth",
+            profileError ? "true" : "false"
         );
-        if (n > 0) pushRecord(REC_STAT, nowUs, (const uint8_t*)statJson, (uint32_t)n);
-        Serial.printf("STAT %s\n", statJson);
+        if (n > 0 && (size_t)n < sizeof(statJson) &&
+            pushRecord(REC_STAT, nowUs, (const uint8_t*)statJson, (uint32_t)n)) {
+            lastStatUs = nowUs;
+            lastReportedProfile = cameraProfile;
+            lastReportedProfileError = profileError;
+            Serial.printf("STAT %s\n", statJson);
+        }
     }
 
     // 取出一筆完整封包。TCP 模式分段寫入，WSS 模式每個訊息送一筆。

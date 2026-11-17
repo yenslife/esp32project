@@ -97,12 +97,12 @@
     }
     .muted { color: var(--muted); font-size: 12px; font-weight: 400; text-decoration: none; }
     a.muted:hover { color: var(--text); text-decoration: underline; }
-    .rotation-control {
+    .view-control {
       display: inline-flex;
       align-items: center;
       gap: 6px;
     }
-    .rotation-control select {
+    .view-control select {
       background: var(--panel-2);
       color: var(--text);
       border: 1px solid var(--border);
@@ -290,6 +290,31 @@
       color: #cbd5e1;
       margin-right: 4px;
     }
+    .signal-levels {
+      display: grid;
+      gap: 3px 8px;
+      grid-template-columns: auto minmax(20px, 1fr) auto;
+      align-items: center;
+      margin-top: 4px;
+      max-width: 240px;
+    }
+    .signal-track {
+      position: relative;
+      background: #303846;
+      height: 5px;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .signal-track::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(90deg, var(--signal-low), var(--signal-high));
+      clip-path: inset(0 calc(100% - var(--signal-level)) 0 0);
+    }
+    .signal-motion { --signal-low: #5286c7; --signal-high: #93c5fd; }
+    .signal-audio { --signal-low: #bc853b; --signal-high: #fcd34d; }
+    .signal-value { text-align: right; }
     .btn-del {
       padding: 5px 9px;
       font-size: 12px;
@@ -333,7 +358,7 @@
             <a id="downloadLink" class="muted" href="#" download>下載 MP4</a>
             <button id="btnBackLive" type="button" class="btn-back">← 返回即時畫面</button>
           </div>
-          <label class="muted rotation-control">
+          <label class="muted view-control">
             旋轉畫面
             <select id="viewRotation">
               <option value="0">0°</option>
@@ -358,6 +383,17 @@
           <input id="eventSeek" type="range" min="0" max="0" step="0.01" value="0" aria-label="播放進度">
           <output id="eventTime" class="muted">0:00 / 0:00</output>
           <button id="eventMute" type="button" aria-pressed="false">靜音</button>
+        </div>
+
+        <div class="trigger-modes">
+          <label class="muted view-control">
+            攝影機畫質
+            <select id="cameraProfile" disabled aria-describedby="cameraProfileStatus">
+              <option value="smooth">流暢 · 320 × 240 · 8 FPS</option>
+              <option value="detail">清晰 · 640 × 480 · 4 FPS</option>
+            </select>
+          </label>
+          <span id="cameraProfileStatus" class="muted" role="status">等待攝影機回報</span>
         </div>
 
         <div class="trigger-modes">
@@ -403,7 +439,7 @@
 
     <aside class="card">
       <div class="card-head">
-        <span>歷史事件錄影（<span id="evtCount">0</span>）</span>
+        <span>歷史事件錄影（<span id="evtCount">0</span>） <span class="muted">台北時間</span></span>
         <span style="display:inline-flex; align-items:center; gap:5px;">
           <span class="muted">保留</span>
           <button type="button" class="mode-btn ret-btn" data-days="1" style="padding:2px 7px;">1天</button>
@@ -422,6 +458,8 @@
     const ctx = canvas.getContext("2d");
     const cameraViewport = document.getElementById("cameraViewport");
     const viewRotation = document.getElementById("viewRotation");
+    const cameraProfile = document.getElementById("cameraProfile");
+    const cameraProfileStatus = document.getElementById("cameraProfileStatus");
     const connDot = document.getElementById("connDot");
     const connText = document.getElementById("connText");
     const espStats = document.getElementById("espStats");
@@ -450,6 +488,11 @@
     const audioThrSlider = document.getElementById("audioThrSlider");
 
     const eventList = document.getElementById("eventList");
+    const taipeiTime = new Intl.DateTimeFormat("zh-TW", {
+      timeZone: "Asia/Taipei",
+      year: "numeric", month: "2-digit", day: "2-digit",
+      hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+    });
     const evtCount = document.getElementById("evtCount");
     const eventVideo = document.getElementById("eventVideo");
     const rotatedPlaybackControls = document.getElementById("rotatedPlaybackControls");
@@ -466,6 +509,8 @@
     let activeEventId = null;
     let frameTimes = [];
     let drawing = false;
+    let savingCameraProfile = false;
+    let cameraProfileSaveFailed = false;
 
     // Web Audio 即時聽音：用 DataView 解讀奇數位移的 little-endian Int16 PCM，避免 Int16Array 對齊錯誤
     let audioEnabled = false;
@@ -597,7 +642,8 @@
     }
 
     function fmtTime(iso) {
-      return (iso || "").replace("T", " ");
+      const date = new Date(iso || "");
+      return Number.isNaN(date.getTime()) ? "時間未記錄" : taipeiTime.format(date);
     }
 
     function updateActiveHighlight() {
@@ -641,6 +687,15 @@
       updateActiveHighlight();
     }
 
+    function recordingSignal(label, kind, value) {
+      const recorded = Number.isFinite(value);
+      const level = recorded ? Math.max(0, Math.min(100, value)) : 0;
+      return `
+        <span>${label}</span>
+        <span class="signal-track signal-${kind}" style="--signal-level: ${level}%;" aria-hidden="true"></span>
+        <span class="signal-value">${recorded ? `${level}%` : "未記錄"}</span>`;
+    }
+
     async function loadEvents(force = false) {
       const res = await fetch("/api/events");
       const data = await res.json();
@@ -666,14 +721,17 @@
         const thumb = e.thumb_url
           ? `<img class="thumb" src="${e.thumb_url}" alt="縮圖" loading="lazy" />`
           : `<div class="thumb"></div>`;
-        const reason = e.trigger_reason || "畫面";
-        const audioMeta = e.peak_audio_pct != null ? ` · 音 ${e.peak_audio_pct}%` : "";
         row.innerHTML = `
           ${thumb}
           <div>
             <div class="evt-title">${fmtTime(e.started_at)}</div>
             <div class="evt-meta">
-              <span class="tag">${reason}</span>${e.duration_s}s · 畫 ${e.peak_motion_pct}%${audioMeta} · ${fmtBytes(e.size_bytes)}
+              ${e.trigger_reason === "持續錄影" ? '<span class="tag">持續錄影</span>' : ""}
+              ${e.duration_s}s · ${fmtBytes(e.size_bytes)}
+              <div class="signal-levels">
+                ${recordingSignal("畫面峰值", "motion", e.peak_motion_pct)}
+                ${recordingSignal("聲音峰值", "audio", e.peak_audio_pct)}
+              </div>
             </div>
           </div>
           <button type="button" class="btn-del" title="刪除此段錄影">刪除</button>
@@ -701,11 +759,27 @@
       audioThrSlider.disabled = mode === "continuous";
     }
 
+    function updateCameraProfile(s) {
+      const applied = s.esp32?.camera_profile;
+      cameraProfile.disabled = !s.connected || !applied || savingCameraProfile;
+      if (savingCameraProfile) return;
+      cameraProfile.value = s.camera_profile || "smooth";
+      let message;
+      if (cameraProfileSaveFailed) message = "儲存失敗，請再試一次";
+      else if (!s.connected) message = "攝影機離線";
+      else if (!applied) message = "等待支援畫質切換的韌體回報";
+      else if (s.esp32.camera_profile_error) message = "攝影機未能套用";
+      else if (applied !== s.camera_profile) message = "等待攝影機套用";
+      else message = "已套用";
+      if (cameraProfileStatus.textContent !== message) cameraProfileStatus.textContent = message;
+    }
+
     async function pollStatus() {
       try {
         const res = await fetch("/api/status");
         const s = await res.json();
         monitoringEnabled = s.monitoring_enabled;
+        updateCameraProfile(s);
 
         connDot.className = "dot" + (s.connected ? " online" : "");
         connText.textContent = s.connected ? "ESP32 已連線" : "等待 ESP32 連線...";
@@ -763,6 +837,7 @@
       } catch (_) {
         connDot.className = "dot";
         connText.textContent = "伺服器離線";
+        cameraProfile.disabled = true;
       }
     }
 
@@ -801,6 +876,21 @@
     });
 
     btnAudio.addEventListener("click", toggleLiveAudio);
+    cameraProfile.addEventListener("change", async () => {
+      savingCameraProfile = true;
+      cameraProfileSaveFailed = false;
+      cameraProfile.disabled = true;
+      cameraProfileStatus.textContent = "正在儲存";
+      try {
+        const response = await fetch(`/api/camera_profile?profile=${cameraProfile.value}`, {method: "POST"});
+        cameraProfileSaveFailed = !response.ok;
+      } catch {
+        cameraProfileSaveFailed = true;
+      } finally {
+        savingCameraProfile = false;
+        await pollStatus();
+      }
+    });
 
     modeButtons.forEach((btn) => {
       btn.addEventListener("click", async () => {

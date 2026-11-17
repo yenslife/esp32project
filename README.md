@@ -11,8 +11,10 @@
   - WebSocket 零緩衝即時畫面（Live View）與一鍵**即時聽音**
   - **監控模式 ON / OFF**（即時下發同步回 ESP32）
   - 即時變動比例條與靈敏度門檻滑桿
-  - 歷史事件縮圖牆、內建播放器、單筆刪除
+  - 歷史事件縮圖牆、內建播放器、單筆刪除，錄影時間以台北時間顯示
+  - 歷史清單以藍色和琥珀色的 0–100 漸層色帶分別顯示畫面峰值與聲音峰值
   - 即時畫面與事件回放可順時針旋轉 0°、90°、180°、270°，角度儲存在目前的瀏覽器
+  - 攝影機畫質可在「流暢」（320 × 240、8 FPS）與「清晰」（640 × 480、4 FPS）之間切換，選擇會儲存在伺服器
 - **錄影自動清理**：預設保留 7 天，整個 `recordings/` 目錄以 10 GB 為上限。超過容量時，從最舊的錄影開始清理，事件影片、縮圖與紀錄會一起刪除。
 
 ## 快速啟動
@@ -63,7 +65,7 @@ curl -f -X POST 'http://localhost:8000/api/trigger_config?max_recording_gb=5'
 2. 將 `include/ingest_secrets.example.h` 複製成 `include/ingest_secrets.h`，填入 HTTPS 網域、路徑、相同的 token，以及簽發站台憑證的根 CA PEM。此檔案已加入忽略規則。Wi‑Fi 帳密仍設定於 `include/secrets.h`。
 3. 使用 USB 執行 `pio run -t upload`。序列監控顯示 `WSS ingest connected` 後，到 Dashboard 確認即時畫面。Wi‑Fi 需能連到站台的 443 埠，並讓 ESP32 透過 SNTP 校時。
 
-韌體有 `include/ingest_secrets.h` 時使用 Espressif 的 WebSocket 用戶端，以 QVGA（320 × 240）串流來降低直連頻寬。原有 TCP 模式維持 VGA。VM 的 `9000` 可只監聽本機。
+韌體有 `include/ingest_secrets.h` 時使用 Espressif 的 WebSocket 用戶端，預設以 QVGA（320 × 240）串流。首次使用 Dashboard 畫質控制要先燒錄支援此功能的韌體；之後可以直接切換。解析度切換時，正在進行的錄影會另起一段。VM 的 `9000` 可只監聽本機。
 
 ## 目錄結構
 

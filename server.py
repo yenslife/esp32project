@@ -18,7 +18,7 @@ import time
 import wave
 import zlib
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
 from fastapi import FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -44,7 +44,7 @@ AUDIO_REF_RMS = 2000.0        # 依 XIAO PDM 麥克風實測校準（安靜底�
 DEFAULT_AUDIO_PCT = 3.5       # 預設聲音變化門檻（%）
 AUDIO_MIN_CHUNKS = 2          # 持續聲音至少 2 個 chunk（~256ms），或單次拍手 >= 2 倍門檻
 
-TriggerMode = Literal["video", "audio", "either", "both"]
+TriggerMode = Literal["video", "audio", "either", "both", "continuous"]
 CONFIG_PATH = Path("config.json")
 
 REC_AUDIO = 1
@@ -126,6 +126,7 @@ class ActiveEvent:
     peak_jpeg: bytes = b""
     by_video: bool = False
     by_audio: bool = False
+    continuous: bool = False
 
 
 def mux_event_sync(stem_path: Path, started_at: datetime, chunks: list[MediaChunk],
@@ -341,6 +342,7 @@ class StreamState:
 
         self.pre_roll: MediaChunk | None = None
         self.active_event: ActiveEvent | None = None
+        self.encoding_tasks: set[asyncio.Task] = set()
         self.events: list[dict] = []
         self.evt_counter = 0
         self.quiet_chunks_skipped = 0
@@ -363,6 +365,15 @@ class StreamState:
                 self.frame_cond.notify_all()
 
     def flush_and_reset(self):
+        if (self.settings.trigger_mode == "continuous" and self.chunk_start_us is not None
+                and self.frames_buf and self.audio_buf):
+            last_audio_us, last_pcm, _ = self.audio_buf[-1]
+            end_us = max(self.frames_buf[-1][0],
+                         last_audio_us + len(last_pcm) // 2 * 1_000_000 // SAMPLE_RATE)
+            self._process_media_chunk(
+                self.chunk_start_us, end_us, self.chunk_wall_time or datetime.now(),
+                self.frames_buf.copy(), self.audio_buf.copy(), None
+            )
         if self.active_event and self.active_event.chunks:
             self._finalize_event(next_frame_us=None)
         self.frames_buf.clear()
@@ -375,6 +386,8 @@ class StreamState:
         self.live_audio_pct = 0.0
 
     def _matches_trigger_mode(self, chunk: MediaChunk) -> bool:
+        if self.settings.trigger_mode == "continuous":
+            return True
         if self.settings.trigger_mode == "video":
             return chunk.video_triggered
         if self.settings.trigger_mode == "audio":
@@ -446,31 +459,33 @@ class StreamState:
             if not c_frames or not c_audio:
                 continue
 
-            v_thr = self.settings.motion_threshold_pct
-            a_thr = self.settings.audio_threshold_pct
-            motion_frames = sum(1 for _, _, s in c_frames if s >= v_thr)
-            peak_frame = max(c_frames, key=lambda x: x[2])
-            loud_chunks = sum(1 for _, _, a in c_audio if a >= a_thr)
-            peak_audio = max(a for _, _, a in c_audio)
+            self._process_media_chunk(start_us, cut_us, wall, c_frames, c_audio, next_frame_us)
 
-            v_trig = motion_frames >= MOTION_MIN_FRAMES
-            a_trig = loud_chunks >= AUDIO_MIN_CHUNKS or peak_audio >= a_thr * 2.0
-
-            chunk = MediaChunk(
-                start_us=start_us,
-                end_us=cut_us,
-                wall_time=wall,
-                frames=c_frames,
-                audio=c_audio,
-                motion_frames=motion_frames,
-                peak_motion_pct=peak_frame[2],
-                peak_jpeg=peak_frame[1],
-                audio_loud_chunks=loud_chunks,
-                peak_audio_pct=peak_audio,
-                video_triggered=v_trig,
-                audio_triggered=a_trig,
-            )
-            self._process_chunk(chunk, next_frame_us)
+    def _process_media_chunk(
+        self, start_us: int, end_us: int, wall: datetime,
+        frames: list[tuple[int, bytes, float]], audio: list[tuple[int, bytes, float]],
+        next_frame_us: int | None,
+    ):
+        v_thr = self.settings.motion_threshold_pct
+        a_thr = self.settings.audio_threshold_pct
+        motion_frames = sum(1 for _, _, score in frames if score >= v_thr)
+        peak_frame = max(frames, key=lambda frame: frame[2])
+        loud_chunks = sum(1 for _, _, level in audio if level >= a_thr)
+        peak_audio = max(level for _, _, level in audio)
+        self._process_chunk(MediaChunk(
+            start_us=start_us,
+            end_us=end_us,
+            wall_time=wall,
+            frames=frames,
+            audio=audio,
+            motion_frames=motion_frames,
+            peak_motion_pct=peak_frame[2],
+            peak_jpeg=peak_frame[1],
+            audio_loud_chunks=loud_chunks,
+            peak_audio_pct=peak_audio,
+            video_triggered=motion_frames >= MOTION_MIN_FRAMES,
+            audio_triggered=loud_chunks >= AUDIO_MIN_CHUNKS or peak_audio >= a_thr * 2.0,
+        ), next_frame_us)
 
     def _process_chunk(self, chunk: MediaChunk, next_frame_us: int | None):
         if self._matches_trigger_mode(chunk):
@@ -486,6 +501,7 @@ class StreamState:
                     peak_jpeg=chunk.peak_jpeg,
                     by_video=chunk.video_triggered,
                     by_audio=chunk.audio_triggered,
+                    continuous=self.settings.trigger_mode == "continuous",
                 )
                 self.pre_roll = None
                 print(f"[TRIGGER:{self.settings.trigger_mode}] Event started "
@@ -522,16 +538,20 @@ class StreamState:
         self.evt_counter += 1
         ts = evt.started_at.strftime("%Y%m%d_%H%M%S")
         stem = EVENTS_DIR / f"evt_{ts}_{self.evt_counter:04d}"
-        if evt.by_video and evt.by_audio:
+        if evt.continuous:
+            reason = "持續錄影"
+        elif evt.by_video and evt.by_audio:
             reason = "畫面+聲音"
         elif evt.by_audio:
             reason = "聲音"
         else:
             reason = "畫面"
-        asyncio.create_task(self._encode_event(
+        task = asyncio.create_task(self._encode_event(
             stem, evt.started_at, evt.chunks, next_frame_us,
             evt.peak_motion_pct, evt.peak_audio_pct, reason, evt.peak_jpeg
         ))
+        self.encoding_tasks.add(task)
+        task.add_done_callback(self.encoding_tasks.discard)
 
     async def _encode_event(self, stem: Path, started_at: datetime, chunks: list[MediaChunk],
                             next_frame_us: int | None, peak_motion_pct: float,
@@ -564,6 +584,8 @@ class StreamState:
             save_settings(settings)
         except OSError as exc:
             raise HTTPException(status_code=500, detail="無法儲存監控設定") from exc
+        if (self.settings.trigger_mode == "continuous") != (settings.trigger_mode == "continuous"):
+            self.flush_and_reset()
         self.settings = settings
 
 
@@ -608,6 +630,8 @@ async def handle_esp32(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             state.expected_seq = (seq + 1) & 0xFFFFFFFF
 
             if rtype in (REC_AUDIO, REC_FRAME):
+                if not state.settings.monitoring_enabled:
+                    continue
                 state.add_media(rtype, t_us, payload)
                 if rtype == REC_FRAME:
                     await state.notify_new_frame()
@@ -621,6 +645,8 @@ async def handle_esp32(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
         if state.writer is writer:
             state.connected = False
             state.writer = None
+            if state.settings.trigger_mode == "continuous":
+                state.flush_and_reset()
         writer.close()
 
 
@@ -650,6 +676,7 @@ async def lifespan(app: FastAPI):
         yield
     cleanup_task.cancel()
     state.flush_and_reset()
+    await asyncio.gather(*state.encoding_tasks)
 
 
 app = FastAPI(title="ESP32-S3 Surveillance Server", lifespan=lifespan)
@@ -732,7 +759,7 @@ async def set_trigger_config(
     retention_days: int | None = Query(default=None, ge=1, le=30),
     max_recording_gb: float | None = Query(default=None, gt=0, allow_inf_nan=False),
 ):
-    if mode is not None and mode not in {"video", "audio", "either", "both"}:
+    if mode is not None and mode not in get_args(TriggerMode):
         raise HTTPException(status_code=400, detail="Invalid trigger mode")
     changes = {
         "trigger_mode": mode,

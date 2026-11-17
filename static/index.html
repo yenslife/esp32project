@@ -137,6 +137,15 @@
       height: 75%;
     }
     .viewport > video { display: none; }
+    .playback-controls:not([hidden]) {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .playback-controls input { flex: 1; min-width: 80px; }
+    .playback-controls output { font-variant-numeric: tabular-nums; }
     .overlay-badges {
       position: absolute;
       top: 10px;
@@ -344,13 +353,20 @@
           </div>
           <div id="pausedMask" class="paused-mask">監控已暫停</div>
         </div>
+        <div id="rotatedPlaybackControls" class="playback-controls" hidden>
+          <button id="eventPlayPause" type="button">播放</button>
+          <input id="eventSeek" type="range" min="0" max="0" step="0.01" value="0" aria-label="播放進度">
+          <output id="eventTime" class="muted">0:00 / 0:00</output>
+          <button id="eventMute" type="button" aria-pressed="false">靜音</button>
+        </div>
 
         <div class="trigger-modes">
-          <span class="mode-label">事件錄影觸發條件：</span>
+          <span class="mode-label">錄影模式</span>
           <button type="button" class="mode-btn active" data-mode="either">畫面或聲音任一</button>
           <button type="button" class="mode-btn" data-mode="video">僅畫面變動</button>
           <button type="button" class="mode-btn" data-mode="audio">僅聲音變動</button>
           <button type="button" class="mode-btn" data-mode="both">畫面＋聲音同時</button>
+          <button type="button" class="mode-btn" data-mode="continuous">持續錄影</button>
         </div>
 
         <div class="meters-grid">
@@ -436,6 +452,11 @@
     const eventList = document.getElementById("eventList");
     const evtCount = document.getElementById("evtCount");
     const eventVideo = document.getElementById("eventVideo");
+    const rotatedPlaybackControls = document.getElementById("rotatedPlaybackControls");
+    const eventPlayPause = document.getElementById("eventPlayPause");
+    const eventSeek = document.getElementById("eventSeek");
+    const eventTime = document.getElementById("eventTime");
+    const eventMute = document.getElementById("eventMute");
     const downloadLink = document.getElementById("downloadLink");
 
     let monitoringEnabled = true;
@@ -456,6 +477,29 @@
       viewRotation.value = rotation;
       cameraViewport.style.setProperty("--view-rotation", `${rotation}deg`);
       cameraViewport.toggleAttribute("data-sideways", rotation === "90" || rotation === "270");
+      updatePlaybackControls();
+    }
+
+    function formatPlaybackTime(seconds) {
+      const wholeSeconds = Math.floor(seconds);
+      return `${Math.floor(wholeSeconds / 60)}:${String(wholeSeconds % 60).padStart(2, "0")}`;
+    }
+
+    function updatePlaybackControls() {
+      const rotated = viewRotation.value !== "0";
+      eventVideo.controls = !rotated;
+      rotatedPlaybackControls.hidden = !rotated || activeEventId === null;
+      if (rotatedPlaybackControls.hidden) return;
+
+      const duration = Number.isFinite(eventVideo.duration) ? eventVideo.duration : 0;
+      const currentTime = eventVideo.currentTime;
+      eventPlayPause.textContent = eventVideo.paused ? "播放" : "暫停";
+      eventSeek.disabled = duration <= 0;
+      eventSeek.max = duration;
+      eventSeek.value = Math.min(currentTime, duration);
+      eventTime.textContent = `${formatPlaybackTime(currentTime)} / ${formatPlaybackTime(duration)}`;
+      eventMute.textContent = eventVideo.muted ? "取消靜音" : "靜音";
+      eventMute.setAttribute("aria-pressed", String(eventVideo.muted));
     }
 
     function toggleLiveAudio() {
@@ -573,6 +617,7 @@
       playbackActions.style.display = "none";
       viewTitle.textContent = "即時畫面（Live View）";
       pausedMask.style.display = monitoringEnabled ? "none" : "flex";
+      updatePlaybackControls();
       updateActiveHighlight();
     }
 
@@ -591,6 +636,7 @@
       viewTitle.textContent = `事件回放 — ${fmtTime(e.started_at)}（${e.duration_s}s）`;
       downloadLink.href = e.video_url;
       eventVideo.src = e.video_url;
+      updatePlaybackControls();
       eventVideo.play().catch(() => {});
       updateActiveHighlight();
     }
@@ -649,8 +695,10 @@
     function applyModeUI(mode) {
       currentMode = mode;
       modeButtons.forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
-      videoMeterBox.classList.toggle("disabled", mode === "audio");
-      audioMeterBox.classList.toggle("disabled", mode === "video");
+      videoMeterBox.classList.toggle("disabled", mode === "audio" || mode === "continuous");
+      audioMeterBox.classList.toggle("disabled", mode === "video" || mode === "continuous");
+      thrSlider.disabled = mode === "continuous";
+      audioThrSlider.disabled = mode === "continuous";
     }
 
     async function pollStatus() {
@@ -678,10 +726,14 @@
           recBadge.textContent = "已暫停";
         } else if (s.recording_event) {
           recBadge.className = "badge rec-active";
-          recBadge.innerHTML = '<span class="dot rec"></span> 錄製事件中 REC';
+          recBadge.innerHTML = s.trigger_mode === "continuous"
+            ? '<span class="dot rec"></span> 持續錄影中'
+            : '<span class="dot rec"></span> 錄製事件中 REC';
         } else {
           recBadge.className = "badge";
-          recBadge.textContent = "待機監控中（前 5s 緩衝）";
+          recBadge.textContent = s.trigger_mode === "continuous"
+            ? "等待影音開始錄影"
+            : "待機監控中（前 5s 緩衝）";
         }
 
         if (s.trigger_mode && s.trigger_mode !== currentMode) {
@@ -715,6 +767,19 @@
     }
 
     btnBackLive.addEventListener("click", backToLive);
+    for (const event of ["loadedmetadata", "durationchange", "timeupdate", "play", "pause", "ended", "volumechange"]) {
+      eventVideo.addEventListener(event, updatePlaybackControls);
+    }
+    eventPlayPause.addEventListener("click", () => {
+      if (eventVideo.paused) eventVideo.play().catch(() => {});
+      else eventVideo.pause();
+    });
+    eventSeek.addEventListener("input", () => {
+      eventVideo.currentTime = Number(eventSeek.value);
+    });
+    eventMute.addEventListener("click", () => {
+      eventVideo.muted = !eventVideo.muted;
+    });
     try {
       applyViewRotation(localStorage.getItem("camera-view-rotation"));
     } catch {
@@ -740,8 +805,9 @@
     modeButtons.forEach((btn) => {
       btn.addEventListener("click", async () => {
         const m = btn.dataset.mode;
-        applyModeUI(m);
-        await fetch(`/api/trigger_config?mode=${m}`, { method: "POST" });
+        const response = await fetch(`/api/trigger_config?mode=${m}`, { method: "POST" });
+        if (response.ok) applyModeUI((await response.json()).trigger_mode);
+        await pollStatus();
       });
     });
 
